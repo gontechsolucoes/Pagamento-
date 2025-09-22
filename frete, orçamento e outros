@@ -1,0 +1,747 @@
+
+Visit - Sistema completo: Orçamento + Deslocamento + Aluguel/Frete + Agendamento + Pagamento + Rastreamento
+Versão Aprimorada e Completa
+"""
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Form, BackgroundTasks, HTTPException, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+import os, requests, math, json, uuid, asyncio
+from enum import Enum
+import logging
+
+# ------------------------------
+# Configuração e Logging
+# ------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./visit.db')
+GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
+MERCADO_PAGO_TOKEN = os.environ.get('MERCADO_PAGO_ACCESS_TOKEN', '')
+TWILIO_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH = os.environ.get('TWILIO_AUTH_TOKEN', '')
+TWILIO_WHATSAPP = os.environ.get('TWILIO_WHATSAPP_NUMBER', '')
+
+# Taxas padrão
+DEFAULT_KM_RATE = float(os.environ.get('DEFAULT_KM_RATE', 2.5))
+URGENCY_SURCHARGE = float(os.environ.get('URGENCY_SURCHARGE', 0.2))  # 20% para urgente
+PLATFORM_FEE = float(os.environ.get('PLATFORM_FEE', 0.1))  # 10% da plataforma
+
+app = FastAPI(title="Visit - Aluguel e Frete Completo", version="2.0")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# ------------------------------
+# Enums para melhor organização
+# ------------------------------
+class ServiceType(str, Enum):
+    ALUGUEL = "aluguel"
+    FRETE = "frete"
+
+class QuoteStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+class PaymentStatus(str, Enum):
+    PENDING = "pending"
+    PAID = "paid"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+
+class RecurrenceType(str, Enum):
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    NONE = "none"
+
+# ------------------------------
+# Models Aprimorados
+# ------------------------------
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    role: str = "client"
+    cashback: float = 0.0
+    rating: float = 0.0
+    total_services: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Provider(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id")
+    vehicle_type: str
+    vehicle_model: Optional[str] = None
+    license_plate: Optional[str] = None
+    max_capacity_kg: Optional[float] = None
+    uses_own_car: bool = True
+    km_rate: float = DEFAULT_KM_RATE
+    base_rate: float = 0.0
+    current_latitude: Optional[float] = None
+    current_longitude: Optional[float] = None
+    is_online: bool = False
+    is_available: bool = True
+    approved: bool = False
+    rating: float = 0.0
+    total_jobs: int = 0
+    total_km: float = 0.0
+
+class Service(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    type: ServiceType
+    name: str
+    description: str
+    base_price: float
+    category: str  # mudança de casa, transporte de equipamentos, etc.
+    insured: bool = False
+    insurance_price: float = 0.0
+    min_duration_hours: float = 1.0
+    is_active: bool = True
+
+class Job(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    client_id: int = Field(foreign_key="user.id")
+    service_id: int = Field(foreign_key="service.id")
+    address: str
+    latitude: float
+    longitude: float
+    scheduled_at: Optional[datetime] = None
+    recurrence: RecurrenceType = RecurrenceType.NONE
+    recurrence_end: Optional[datetime] = None
+    is_urgent: bool = False
+    details: Optional[str] = None  # Informações adicionais
+    status: str = "pending"  # pending, scheduled, in_progress, completed, cancelled
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Quote(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(foreign_key="provider.id")
+    job_id: int = Field(foreign_key="job.id")
+    service_price: float
+    include_displacement: bool = True
+    displacement_km: Optional[float] = None
+    displacement_price: Optional[float] = None
+    urgency_surcharge: float = 0.0
+    insurance_price: float = 0.0
+    platform_fee: float = 0.0
+    discount: float = 0.0
+    total_price: float
+    estimated_duration_min: Optional[int] = None
+    validity_minutes: int = 60  # Tempo que a cotação é válida
+    status: QuoteStatus = QuoteStatus.PENDING
+    expires_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Trip(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(foreign_key="provider.id")
+    job_id: int = Field(foreign_key="job.id")
+    quote_id: int = Field(foreign_key="quote.id")
+    start_latitude: Optional[float] = None
+    start_longitude: Optional[float] = None
+    end_latitude: Optional[float] = None
+    end_longitude: Optional[float] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    actual_distance: Optional[float] = None
+    actual_duration: Optional[int] = None  # em minutos
+    path_track: Optional[str] = None  # JSON com pontos do trajeto
+
+class Payment(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    quote_id: int = Field(foreign_key="quote.id")
+    external_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    status: PaymentStatus = PaymentStatus.PENDING
+    gateway: str = "mercadopago"
+    total_value: float = 0.0
+    cashback_applied: float = 0.0
+    cashback_earned: float = 0.0
+    coupon_discount: float = 0.0
+    payment_method: Optional[str] = None
+    paid_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Coupon(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    code: str = Field(unique=True)
+    discount_percent: float
+    discount_amount: Optional[float] = None
+    max_discount: Optional[float] = None
+    min_order_value: float = 0.0
+    limit_use: int = 100
+    used_count: int = 0
+    expires_at: Optional[datetime] = None
+    type: str = "both"  # service / displacement / both
+    is_active: bool = True
+
+class Rating(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    job_id: int = Field(foreign_key="job.id")
+    from_user_id: int = Field(foreign_key="user.id")
+    to_user_id: int = Field(foreign_key="user.id")
+    rating: int = Field(ge=1, le=5)  # 1-5 estrelas
+    comment: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+# ------------------------------
+# Database Setup
+# ------------------------------
+engine = create_engine(DATABASE_URL, echo=True)
+SQLModel.metadata.create_all(engine)
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+# ------------------------------
+# Utilities Aprimoradas
+# ------------------------------
+class GeoUtils:
+    @staticmethod
+    def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calcula distância em km usando fórmula de Haversine"""
+        R = 6371.0
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+        return 2*R*math.asin(math.sqrt(a))
+    
+    @staticmethod
+    def get_distance_matrix(origin_lat: float, origin_lng: float, 
+                          dest_lat: float, dest_lng: float) -> Dict[str, Any]:
+        """Obtém distância e tempo via Google Maps API ou fallback"""
+        if GOOGLE_MAPS_API_KEY:
+            try:
+                url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+                params = {
+                    'origins': f"{origin_lat},{origin_lng}",
+                    'destinations': f"{dest_lat},{dest_lng}",
+                    'key': GOOGLE_MAPS_API_KEY,
+                    'units': 'metric',
+                    'mode': 'driving'
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data['status'] == 'OK':
+                    element = data['rows'][0]['elements'][0]
+                    if element['status'] == 'OK':
+                        distance_km = element['distance']['value'] / 1000
+                        duration_min = element['duration']['value'] / 60
+                        return {
+                            "distance_km": round(distance_km, 2),
+                            "duration_min": round(duration_min, 0),
+                            "mode": "google"
+                        }
+            except Exception as e:
+                logger.warning(f"Google Maps API failed: {e}")
+        
+        # Fallback para cálculo aproximado
+        distance_km = GeoUtils.haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+        duration_min = (distance_km / 40) * 60  # Assume 40km/h média
+        return {
+            "distance_km": round(distance_km, 2),
+            "duration_min": round(duration_min, 0),
+            "mode": "approximate"
+        }
+
+class PricingEngine:
+    @staticmethod
+    def calculate_displacement_price(provider: Provider, distance_km: float, 
+                                   is_urgent: bool = False) -> float:
+        """Calcula preço do deslocamento"""
+        if provider.uses_own_car:
+            base_price = distance_km * provider.km_rate
+        else:
+            # Simulação de API de terceiros (Uber/99)
+            base_price = 5.0 + (distance_km * 2.5)
+        
+        if is_urgent:
+            base_price *= (1 + URGENCY_SURCHARGE)
+        
+        return round(base_price, 2)
+    
+    @staticmethod
+    def calculate_platform_fee(service_price: float, displacement_price: float) -> float:
+        """Calcula taxa da plataforma"""
+        total = service_price + displacement_price
+        return round(total * PLATFORM_FEE, 2)
+    
+    @staticmethod
+    def apply_coupon_discount(total_price: float, coupon: Coupon, 
+                            service_price: float, displacement_price: float) -> float:
+        """Aplica desconto de cupom conforme tipo"""
+        if coupon.discount_amount:
+            discount = coupon.discount_amount
+        else:
+            if coupon.type == "service":
+                base = service_price
+            elif coupon.type == "displacement":
+                base = displacement_price
+            else:  # both
+                base = service_price + displacement_price
+            
+            discount = base * (coupon.discount_percent / 100)
+        
+        if coupon.max_discount and discount > coupon.max_discount:
+            discount = coupon.max_discount
+        
+        return round(discount, 2)
+
+class NotificationService:
+    @staticmethod
+    async def send_whatsapp_notification(phone: str, message: str):
+        """Envia notificação via WhatsApp usando Twilio"""
+        if not all([TWILIO_SID, TWILIO_AUTH, TWILIO_WHATSAPP]):
+            logger.info(f"WhatsApp notification simulated: {message}")
+            return
+        
+        try:
+            from twilio.rest import Client
+            client = Client(TWILIO_SID, TWILIO_AUTH)
+            message = client.messages.create(
+                body=message,
+                from_=f'whatsapp:{TWILIO_WHATSAPP}',
+                to=f'whatsapp:{phone}'
+            )
+            logger.info(f"WhatsApp notification sent: {message.sid}")
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp: {e}")
+    
+    @staticmethod
+    async def send_quote_notification(provider_name: str, client_phone: str, total_price: float):
+        """Notifica cliente sobre nova cotação"""
+        message = f"✅ Nova cotação de {provider_name}: R$ {total_price:.2f}. Acesse para aprovar!"
+        await NotificationService.send_whatsapp_notification(client_phone, message)
+
+# ------------------------------
+# WebSocket para Rastreamento em Tempo Real
+# ------------------------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, WebSocket] = {}
+    
+    async def connect(self, websocket: WebSocket, provider_id: int):
+        await websocket.accept()
+        self.active_connections[provider_id] = websocket
+    
+    def disconnect(self, provider_id: int):
+        if provider_id in self.active_connections:
+            del self.active_connections[provider_id]
+    
+    async def send_personal_message(self, message: dict, provider_id: int):
+        if provider_id in self.active_connections:
+            try:
+                await self.active_connections[provider_id].send_json(message)
+            except:
+                self.disconnect(provider_id)
+    
+    async def broadcast_to_clients(self, message: dict):
+        """Broadcast para todos os clientes conectados"""
+        for connection in list(self.active_connections.values()):
+            try:
+                await connection.send_json(message)
+            except:
+                pass
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/tracking/{provider_id}")
+async def websocket_tracking(websocket: WebSocket, provider_id: int):
+    await manager.connect(websocket, provider_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Atualiza localização do prestador
+            if data.get('type') == 'location_update':
+                await update_provider_location(provider_id, data['lat'], data['lng'])
+                # Broadcast para clientes interessados
+                broadcast_msg = {
+                    'type': 'provider_location',
+                    'provider_id': provider_id,
+                    'lat': data['lat'],
+                    'lng': data['lng'],
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+                await manager.broadcast_to_clients(broadcast_msg)
+    except WebSocketDisconnect:
+        manager.disconnect(provider_id)
+
+async def update_provider_location(provider_id: int, lat: float, lng: float):
+    """Atualiza localização do prestador no banco"""
+    with Session(engine) as session:
+        provider = session.get(Provider, provider_id)
+        if provider:
+            provider.current_latitude = lat
+            provider.current_longitude = lng
+            session.commit()
+
+# ------------------------------
+# Endpoints Principais Aprimorados
+# ------------------------------
+
+@app.post("/api/jobs/create", response_model=Job)
+async def create_job(
+    background_tasks: BackgroundTasks,
+    client_id: int = Form(...),
+    service_id: int = Form(...),
+    address: str = Form(...),
+    lat: float = Form(...),
+    lng: float = Form(...),
+    scheduled_at: Optional[datetime] = Form(None),
+    recurrence: RecurrenceType = Form(RecurrenceType.NONE),
+    is_urgent: bool = Form(False),
+    details: Optional[str] = Form(None),
+    session: Session = Depends(get_session)
+):
+    """Cria um novo job e busca prestadores próximos automaticamente"""
+    # Verifica se o serviço existe
+    service = session.get(Service, service_id)
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+    
+    # Cria o job
+    job = Job(
+        client_id=client_id,
+        service_id=service_id,
+        address=address,
+        latitude=lat,
+        longitude=lng,
+        scheduled_at=scheduled_at,
+        recurrence=recurrence,
+        is_urgent=is_urgent,
+        details=details
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    
+    # Busca prestadores próximos em background
+    background_tasks.add_task(find_nearby_providers, job.id, lat, lng)
+    
+    return job
+
+async def find_nearby_providers(job_id: int, dest_lat: float, dest_lng: float, radius_km: float = 20.0):
+    """Encontra prestadores próximos e cria cotações automáticas"""
+    with Session(engine) as session:
+        job = session.get(Job, job_id)
+        if not job:
+            return
+        
+        # Busca prestadores online e disponíveis
+        statement = select(Provider).where(
+            Provider.is_online == True,
+            Provider.is_available == True,
+            Provider.approved == True
+        )
+        providers = session.exec(statement).all()
+        
+        for provider in providers:
+            if provider.current_latitude and provider.current_longitude:
+                distance = GeoUtils.haversine_km(
+                    provider.current_latitude, provider.current_longitude,
+                    dest_lat, dest_lng
+                )
+                
+                if distance <= radius_km:
+                    # Cria cotação automática
+                    await create_auto_quote(session, job, provider, distance)
+
+async def create_auto_quote(session: Session, job: Job, provider: Provider, distance_km: float):
+    """Cria cotação automática para prestador próximo"""
+    service = session.get(Service, job.service_id)
+    
+    # Calcula preços
+    displacement_price = PricingEngine.calculate_displacement_price(
+        provider, distance_km, job.is_urgent
+    )
+    platform_fee = PricingEngine.calculate_platform_fee(service.base_price, displacement_price)
+    urgency_surcharge = service.base_price * URGENCY_SURCHARGE if job.is_urgent else 0
+    
+    total_price = service.base_price + displacement_price + platform_fee + urgency_surcharge
+    
+    # Cria a cotação
+    quote = Quote(
+        provider_id=provider.id,
+        job_id=job.id,
+        service_price=service.base_price,
+        include_displacement=True,
+        displacement_km=distance_km,
+        displacement_price=displacement_price,
+        urgency_surcharge=urgency_surcharge,
+        platform_fee=platform_fee,
+        total_price=total_price,
+        estimated_duration_min=30,  # Estimativa básica
+        expires_at=datetime.utcnow() + timedelta(minutes=60)
+    )
+    
+    session.add(quote)
+    session.commit()
+    
+    # Notifica o cliente
+    client = session.get(User, job.client_id)
+    if client and client.phone:
+        await NotificationService.send_quote_notification(
+            provider.user.name, client.phone, total_price
+        )
+
+@app.post("/api/quotes/{quote_id}/accept")
+async def accept_quote(
+    quote_id: int,
+    coupon_code: Optional[str] = Form(None),
+    session: Session = Depends(get_session)
+):
+    """Aceita uma cotação e inicia processo de pagamento"""
+    quote = session.get(Quote, quote_id)
+    if not quote:
+        raise HTTPException(status_code=404, detail="Quote not found")
+    
+    if quote.status != QuoteStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Quote already processed")
+    
+    # Aplica cupom se fornecido
+    discount = 0.0
+    if coupon_code:
+        coupon = session.exec(select(Coupon).where(Coupon.code == coupon_code)).first()
+        if coupon and coupon.is_active and coupon.used_count < coupon.limit_use:
+            discount = PricingEngine.apply_coupon_discount(
+                quote.total_price, coupon, quote.service_price, quote.displacement_price or 0
+            )
+            coupon.used_count += 1
+    
+    # Cria pagamento
+    payment = Payment(
+        quote_id=quote.id,
+        total_value=quote.total_price - discount,
+        coupon_discount=discount
+    )
+    
+    session.add(payment)
+    quote.status = QuoteStatus.ACCEPTED
+    session.commit()
+    
+    # Inicia processo de pagamento (integrar com Mercado Pago)
+    payment_url = await create_mercado_pago_payment(payment)
+    
+    return {
+        "payment_id": payment.id,
+        "payment_url": payment_url,
+        "total_value": payment.total_value
+    }
+
+async def create_mercado_pago_payment(payment: Payment) -> str:
+    """Integração com Mercado Pago"""
+    if not MERCADO_PAGO_TOKEN:
+        # Modo de desenvolvimento - retorna URL simulada
+        return f"http://localhost:8000/payment/simulate/{payment.external_id}"
+    
+    # Implementação real da API do Mercado Pago
+    try:
+        url = "https://api.mercadopago.com/v1/payments"
+        headers = {
+            "Authorization": f"Bearer {MERCADO_PAGO_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "transaction_amount": payment.total_value,
+            "description": "Serviço Visit",
+            "payment_method_id": "pix",
+            "payer": {
+                "email": "client@example.com"  # Obter do usuário
+            }
+        }
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data.get('point_of_interaction', {}).get('transaction_data', {}).get('ticket_url', '')
+    except Exception as e:
+        logger.error(f"Mercado Pago error: {e}")
+        raise HTTPException(status_code=500, detail="Payment gateway error")
+
+@app.get("/api/providers/nearby")
+def get_nearby_providers(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_km: float = Query(10.0),
+    service_type: Optional[ServiceType] = Query(None),
+    session: Session = Depends(get_session)
+):
+    """Busca prestadores próximos com filtros"""
+    statement = select(Provider).where(
+        Provider.is_online == True,
+        Provider.is_available == True,
+        Provider.approved == True
+    )
+    
+    if service_type:
+        statement = statement.where(Provider.vehicle_type == service_type.value)
+    
+    providers = session.exec(statement).all()
+    
+    nearby_providers = []
+    for provider in providers:
+        if provider.current_latitude and provider.current_longitude:
+            distance = GeoUtils.haversine_km(lat, lng, provider.current_latitude, provider.current_longitude)
+            if distance <= radius_km:
+                provider_data = provider.dict()
+                provider_data['distance_km'] = round(distance, 2)
+                provider_data['user'] = session.get(User, provider.user_id).dict()
+                nearby_providers.append(provider_data)
+    
+    return sorted(nearby_providers, key=lambda x: x['distance_km'])
+
+@app.post("/api/trips/{trip_id}/start")
+def start_trip(trip_id: int, session: Session = Depends(get_session)):
+    """Inicia uma viagem/deslocamento"""
+    trip = session.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    
+    trip.started_at = datetime.utcnow()
+    session.commit()
+    
+    return {"message": "Trip started", "trip_id": trip_id}
+
+@app.post("/api/trips/{trip_id}/complete")
+def complete_trip(
+    trip_id: int,
+    actual_distance: float = Form(...),
+    actual_duration: int = Form(...),
+    session: Session = Depends(get_session)
+):
+    """Finaliza uma viagem com dados reais"""
+    trip = session.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    
+    trip.ended_at = datetime.utcnow()
+    trip.actual_distance = actual_distance
+    trip.actual_duration = actual_duration
+    session.commit()
+    
+    # Atualiza estatísticas do prestador
+    provider = session.get(Provider, trip.provider_id)
+    if provider:
+        provider.total_jobs += 1
+        provider.total_km += actual_distance
+        session.commit()
+    
+    return {"message": "Trip completed", "trip_id": trip_id}
+
+# ------------------------------
+# Endpoints Admin
+# ------------------------------
+
+@app.get("/admin/dashboard")
+def admin_dashboard(session: Session = Depends(get_session)):
+    """Dashboard administrativo com métricas"""
+    # Estatísticas básicas
+    total_jobs = session.exec(select(Job)).all()
+    total_providers = session.exec(select(Provider).where(Provider.approved == True)).all()
+    total_revenue = session.exec(select(Payment).where(Payment.status == PaymentStatus.PAID)).all()
+    
+    revenue = sum(payment.total_value for payment in total_revenue)
+    platform_earnings = sum(payment.total_value * PLATFORM_FEE for payment in total_revenue)
+    
+    # Prestadores top
+    top_providers = session.exec(
+        select(Provider)
+        .where(Provider.approved == True)
+        .order_by(Provider.rating.desc())
+        .limit(5)
+    ).all()
+    
+    return {
+        "total_jobs": len(total_jobs),
+        "active_providers": len([p for p in total_providers if p.is_online]),
+        "total_revenue": revenue,
+        "platform_earnings": platform_earnings,
+        "top_providers": [
+            {
+                "id": p.id,
+                "name": session.get(User, p.user_id).name,
+                "rating": p.rating,
+                "total_jobs": p.total_jobs,
+                "total_km": p.total_km
+            }
+            for p in top_providers
+        ]
+    }
+
+# ------------------------------
+# Frontend Básico
+# ------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/tracking/{job_id}", response_class=HTMLResponse)
+async def tracking_page(request: Request, job_id: int):
+    return templates.TemplateResponse("tracking.html", {"request": request, "job_id": job_id})
+
+# ------------------------------
+# Health Check
+# ------------------------------
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "2.0"
+    }
+
+# ------------------------------
+# Inicialização
+# ------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    """Popula o banco com dados de exemplo"""
+    with Session(engine) as session:
+        # Cria serviços exemplo
+        services = [
+            Service(
+                type=ServiceType.ALUGUEL,
+                name="Carro de Passeio",
+                description="Aluguel de carro para passeio ou viagens curtas",
+                base_price=50.0,
+                category="transporte",
+                insured=True,
+                insurance_price=10.0
+            ),
+            Service(
+                type=ServiceType.FRETE,
+                name="Frete Pequeno",
+                description="Transporte de pequenas cargas até 100kg",
+                base_price=30.0,
+                category="mudança",
+                insured=False
+            )
+        ]
+        
+        for service in services:
+            existing = session.exec(select(Service).where(Service.name == service.name)).first()
+            if not existing:
+                session.add(service)
+        
+        session.commit()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
