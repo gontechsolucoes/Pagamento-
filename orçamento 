@@ -1,0 +1,868 @@
+
+
+```python
+"""
+Visit - Módulo completo de deslocamento + orçamentos (single-file)
+FastAPI backend com SQLModel
+"""
+
+import os
+import uuid
+import math
+import json
+import asyncio
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+from enum import Enum
+
+from fastapi import (
+    FastAPI, WebSocket, WebSocketDisconnect, Depends, 
+    Request, Form, BackgroundTasks, HTTPException, Query
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer
+
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+import requests
+from pydantic import BaseModel, validator
+import logging
+
+# Configuração
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./visit.db')
+GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
+UBER_SERVER_TOKEN = os.environ.get('UBER_SERVER_TOKEN', '')
+DEFAULT_KM_RATE = float(os.environ.get('DEFAULT_KM_RATE', 1.5))
+APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Visit - Deslocamento & Orçamentos",
+    description="Sistema completo para gerenciamento de deslocamentos e orçamentos",
+    version="1.0.0"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Security
+security = HTTPBearer()
+
+# Static + templates
+os.makedirs("./static", exist_ok=True)
+os.makedirs("./templates", exist_ok=True)
+
+app.mount("/static", StaticFiles(directory="./static"), name="static")
+templates = Jinja2Templates(directory="./templates")
+
+# Enums
+class TripStatus(str, Enum):
+    PENDING = "pending"
+    STARTED = "started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+class QuoteStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+# DB Models
+class Provider(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    email: Optional[str] = Field(index=True)
+    phone: Optional[str] = None
+    uses_own_car: bool = True
+    km_rate: float = DEFAULT_KM_RATE
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    approved: bool = False
+    active: bool = True
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Job(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    client_name: str
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    address: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+    urgency: str = "normal"  # low, normal, high, emergency
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    status: str = "open"  # open, assigned, in_progress, completed, cancelled
+
+class Quote(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(foreign_key="provider.id")
+    job_id: int = Field(foreign_key="job.id")
+    service_price: float
+    include_displacement: bool = True
+    displacement_km: Optional[float] = None
+    displacement_price: Optional[float] = None
+    total_price: Optional[float] = None
+    status: QuoteStatus = QuoteStatus.PENDING
+    expires_at: datetime = Field(default_factory=lambda: datetime.utcnow() + timedelta(hours=24))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    accepted_at: Optional[datetime] = None
+
+class Trip(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(foreign_key="provider.id")
+    job_id: int = Field(foreign_key="job.id")
+    quote_id: Optional[int] = Field(foreign_key="quote.id", default=None)
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    status: TripStatus = TripStatus.PENDING
+    path: Optional[str] = None  # JSON serialized path
+    estimated_duration_min: Optional[int] = None
+    actual_duration_min: Optional[int] = None
+    distance_km: Optional[float] = None
+
+class ProviderLocation(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(foreign_key="provider.id")
+    latitude: float
+    longitude: float
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    accuracy: Optional[float] = None  # GPS accuracy in meters
+
+# Pydantic Models para requests/responses
+class QuoteCreate(BaseModel):
+    provider_id: int
+    job_id: int
+    service_price: float
+    include_displacement: bool = True
+
+    @validator('service_price')
+    def validate_price(cls, v):
+        if v <= 0:
+            raise ValueError('Price must be positive')
+        return v
+
+class ProviderCreate(BaseModel):
+    name: str
+    email: Optional[str]
+    phone: Optional[str]
+    uses_own_car: bool = True
+    km_rate: float = DEFAULT_KM_RATE
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class JobCreate(BaseModel):
+    client_name: str
+    client_email: Optional[str] = None
+    client_phone: Optional[str] = None
+    address: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+    urgency: str = "normal"
+
+# DB setup
+engine = create_engine(DATABASE_URL, echo=False)
+
+def create_db_and_tables():
+    SQLModel.metadata.create_all(engine)
+
+@app.on_event("startup")
+def on_startup():
+    create_db_and_tables()
+    logger.info("Database tables created")
+
+# Dependência de sessão do banco
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+# Utility: haversine (fallback se Google falhar)
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two points in km using Haversine formula"""
+    R = 6371.0  # Earth radius in km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+# Serviço: Google Distance Matrix
+def google_distance_matrix(origin_lat: float, origin_lng: float, 
+                          dest_lat: float, dest_lng: float) -> Dict[str, Any]:
+    """Get real distance and duration from Google Distance Matrix API"""
+    
+    # Fallback se não houver chave da API
+    if not GOOGLE_MAPS_API_KEY:
+        km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+        minutes = (km / 40.0) * 60  # assume avg speed 40 km/h
+        return {
+            "distance_km": round(km, 2), 
+            "duration_min": round(minutes, 0), 
+            "mode": "approximation"
+        }
+
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        'origins': f"{origin_lat},{origin_lng}",
+        'destinations': f"{dest_lat},{dest_lng}",
+        'key': GOOGLE_MAPS_API_KEY,
+        'units': 'metric',
+        'mode': 'driving'
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data['status'] != 'OK':
+            raise ValueError(f"Google API error: {data.get('error_message', 'Unknown error')}")
+        
+        element = data['rows'][0]['elements'][0]
+        if element['status'] != 'OK':
+            raise ValueError(f"Route error: {element.get('status', 'Unknown error')}")
+        
+        distance_m = element['distance']['value']
+        duration_s = element['duration']['value']
+        
+        return {
+            "distance_km": round(distance_m / 1000.0, 2), 
+            "duration_min": round(duration_s / 60.0, 0), 
+            "mode": "google_driving"
+        }
+        
+    except Exception as e:
+        logger.warning(f"Google Distance Matrix failed: {e}. Using fallback.")
+        km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+        minutes = (km / 40.0) * 60
+        return {
+            "distance_km": round(km, 2), 
+            "duration_min": round(minutes, 0), 
+            "mode": "fallback"
+        }
+
+# Serviço: Estimativas Uber/99 (placeholders melhorados)
+def estimate_ride_service_price(origin_lat: float, origin_lng: float, 
+                               dest_lat: float, dest_lng: float, 
+                               service: str = "uber") -> Dict[str, Any]:
+    """Estimate ride service prices with more realistic calculations"""
+    
+    dist_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+    
+    # Base fares and rates (approximate Brazilian prices)
+    base_fares = {
+        "uber": {"base": 4.00, "per_km": 2.20, "per_min": 0.40, "min_fare": 8.00},
+        "uber_black": {"base": 8.00, "per_km": 3.50, "per_min": 0.60, "min_fare": 15.00},
+        "99": {"base": 3.50, "per_km": 2.00, "per_min": 0.35, "min_fare": 7.50},
+        "99_executivo": {"base": 7.00, "per_km": 3.00, "per_min": 0.50, "min_fare": 14.00}
+    }
+    
+    rates = base_fares.get(service, base_fares["uber"])
+    
+    # Estimate time based on distance and traffic conditions
+    avg_speed_kmh = 25  # Conservative estimate for city traffic
+    estimated_minutes = (dist_km / avg_speed_kmh) * 60
+    
+    # Calculate fare
+    fare = (rates["base"] + 
+           (dist_km * rates["per_km"]) + 
+           (estimated_minutes * rates["per_min"]))
+    
+    fare = max(fare, rates["min_fare"])
+    
+    return {
+        "service": service,
+        "estimated_price": round(fare, 2),
+        "distance_km": round(dist_km, 2),
+        "duration_min": round(estimated_minutes, 0),
+        "currency": "BRL"
+    }
+
+# Gerenciador de WebSocket para localização em tempo real
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, WebSocket] = {}
+        self.provider_locations: Dict[int, Dict] = {}
+
+    async def connect(self, websocket: WebSocket, provider_id: int):
+        await websocket.accept()
+        self.active_connections[provider_id] = websocket
+        logger.info(f"Provider {provider_id} connected via WebSocket")
+
+    def disconnect(self, provider_id: int):
+        if provider_id in self.active_connections:
+            del self.active_connections[provider_id]
+        if provider_id in self.provider_locations:
+            del self.provider_locations[provider_id]
+        logger.info(f"Provider {provider_id} disconnected")
+
+    async def send_personal_message(self, message: dict, provider_id: int):
+        if provider_id in self.active_connections:
+            try:
+                await self.active_connections[provider_id].send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending message to provider {provider_id}: {e}")
+
+    async def broadcast_to_job(self, message: dict, job_id: int):
+        # Broadcast para todos interessados neste job (seria implementado com rooms)
+        for connection in self.active_connections.values():
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Error broadcasting message: {e}")
+
+    def update_provider_location(self, provider_id: int, latitude: float, longitude: float, accuracy: float = None):
+        self.provider_locations[provider_id] = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": accuracy,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    def get_provider_location(self, provider_id: int) -> Optional[Dict]:
+        return self.provider_locations.get(provider_id)
+
+manager = ConnectionManager()
+
+# Endpoints principais
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request, session: Session = Depends(get_session)):
+    """Página inicial com mapa e lista de providers"""
+    providers = session.exec(
+        select(Provider).where(Provider.approved == True, Provider.active == True)
+    ).all()
+    return templates.TemplateResponse("index.html", {
+        "request": request, 
+        "providers": providers,
+        "google_maps_key": GOOGLE_MAPS_API_KEY
+    })
+
+@app.post("/providers", response_model=Provider)
+def create_provider(
+    provider: ProviderCreate,
+    session: Session = Depends(get_session)
+):
+    """Criar novo provider"""
+    # Verificar se email já existe
+    if provider.email:
+        existing = session.exec(
+            select(Provider).where(Provider.email == provider.email)
+        ).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email já cadastrado")
+    
+    db_provider = Provider(**provider.dict())
+    session.add(db_provider)
+    session.commit()
+    session.refresh(db_provider)
+    
+    logger.info(f"New provider created: {db_provider.name} (ID: {db_provider.id})")
+    return db_provider
+
+@app.get("/providers", response_model=List[Provider])
+def list_providers(
+    approved: Optional[bool] = Query(None),
+    active: Optional[bool] = Query(None),
+    session: Session = Depends(get_session)
+):
+    """Listar providers com filtros"""
+    query = select(Provider)
+    
+    if approved is not None:
+        query = query.where(Provider.approved == approved)
+    if active is not None:
+        query = query.where(Provider.active == active)
+    
+    return session.exec(query.order_by(Provider.name)).all()
+
+@app.post("/jobs", response_model=Job)
+def create_job(job: JobCreate, session: Session = Depends(get_session)):
+    """Criar novo job"""
+    db_job = Job(**job.dict())
+    session.add(db_job)
+    session.commit()
+    session.refresh(db_job)
+    
+    logger.info(f"New job created for {db_job.client_name} (ID: {db_job.id})")
+    return db_job
+
+@app.post("/quotes", response_model=Quote)
+def generate_quote(quote_data: QuoteCreate, session: Session = Depends(get_session)):
+    """Gerar orçamento com cálculo de deslocamento"""
+    provider = session.get(Provider, quote_data.provider_id)
+    job = session.get(Job, quote_data.job_id)
+    
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider não encontrado")
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    if not provider.approved:
+        raise HTTPException(status_code=400, detail="Provider não está aprovado")
+    
+    # Calcular distância e tempo
+    if provider.latitude and provider.longitude:
+        dist_data = google_distance_matrix(
+            provider.latitude, provider.longitude,
+            job.latitude, job.longitude
+        )
+        displacement_km = dist_data["distance_km"]
+        duration_min = dist_data["duration_min"]
+    else:
+        displacement_km = 0.0
+        duration_min = None
+    
+    # Calcular preço do deslocamento
+    displacement_price = 0.0
+    if quote_data.include_displacement and displacement_km > 0:
+        if provider.uses_own_car:
+            displacement_price = displacement_km * provider.km_rate
+        else:
+            # Estimar via serviço de ride
+            estimate = estimate_ride_service_price(
+                provider.latitude, provider.longitude,
+                job.latitude, job.longitude
+            )
+            displacement_price = estimate["estimated_price"]
+    
+    total_price = quote_data.service_price + displacement_price
+    
+    quote = Quote(
+        **quote_data.dict(),
+        displacement_km=round(displacement_km, 2),
+        displacement_price=round(displacement_price, 2),
+        total_price=round(total_price, 2),
+        expires_at=datetime.utcnow() + timedelta(hours=24)
+    )
+    
+    session.add(quote)
+    session.commit()
+    session.refresh(quote)
+    
+    logger.info(f"Quote generated: R${total_price:.2f} for job {job.id}")
+    return quote
+
+@app.post("/quotes/{quote_id}/accept")
+def accept_quote(quote_id: int, session: Session = Depends(get_session)):
+    """Aceitar orçamento"""
+    quote = session.get(Quote, quote_id)
+    if not quote:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    if quote.status != QuoteStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Orçamento já foi processado")
+    
+    if quote.expires_at < datetime.utcnow():
+        quote.status = QuoteStatus.EXPIRED
+        session.commit()
+        raise HTTPException(status_code=400, detail="Orçamento expirado")
+    
+    quote.status = QuoteStatus.ACCEPTED
+    quote.accepted_at = datetime.utcnow()
+    
+    # Atualizar status do job
+    job = session.get(Job, quote.job_id)
+    if job:
+        job.status = "assigned"
+        session.add(job)
+    
+    session.commit()
+    
+    logger.info(f"Quote {quote_id} accepted")
+    return {"message": "Orçamento aceito com sucesso", "quote": quote}
+
+@app.get("/quotes/{quote_id}/whatsapp")
+def generate_whatsapp_link(quote_id: int, session: Session = Depends(get_session)):
+    """Gerar link do WhatsApp para enviar orçamento"""
+    quote = session.get(Quote, quote_id)
+    if not quote:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    provider = session.get(Provider, quote.provider_id)
+    job = session.get(Job, quote.job_id)
+    
+    message = f"""*Visit - Orçamento*
+
+*Prestador:* {provider.name}
+*Serviço:* R$ {quote.service_price:.2f}"""
+
+    if quote.include_displacement:
+        message += f"""
+*Deslocamento:* R$ {quote.displacement_price:.2f} ({quote.displacement_km} km)"""
+    
+    message += f"""
+*Total:* R$ {quote.total_price:.2f}
+
+*Detalhes do serviço:*
+{job.description or 'Sem descrição adicional'}
+
+*Local:* {job.address}"""
+
+    # Codificar mensagem para URL
+    encoded_message = requests.utils.quote(message)
+    
+    if job.client_phone:
+        phone = job.client_phone.replace('+', '').replace(' ', '').replace('-', '')
+        whatsapp_url = f"https://wa.me/55{phone}?text={encoded_message}"
+        return RedirectResponse(whatsapp_url)
+    else:
+        return {"message": message, "whatsapp_url": None}
+
+# WebSocket para localização em tempo real
+@app.websocket("/ws/provider/{provider_id}")
+async def websocket_provider_location(websocket: WebSocket, provider_id: int):
+    await manager.connect(websocket, provider_id)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            
+            # Atualizar localização do provider
+            if data.get("type") == "location_update":
+                lat = data.get("latitude")
+                lng = data.get("longitude")
+                accuracy = data.get("accuracy")
+                
+                if lat and lng:
+                    manager.update_provider_location(provider_id, lat, lng, accuracy)
+                    
+                    # Salvar no banco (opcional, para histórico)
+                    with Session(engine) as session:
+                        location = ProviderLocation(
+                            provider_id=provider_id,
+                            latitude=lat,
+                            longitude=lng,
+                            accuracy=accuracy
+                        )
+                        session.add(location)
+                        session.commit()
+                    
+                    # Broadcast para interessados (ex: cliente acompanhando)
+                    await manager.broadcast_to_job({
+                        "type": "provider_location",
+                        "provider_id": provider_id,
+                        "latitude": lat,
+                        "longitude": lng,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }, job_id=0)  # Em implementação real, associar a job específica
+                    
+    except WebSocketDisconnect:
+        manager.disconnect(provider_id)
+    except Exception as e:
+        logger.error(f"WebSocket error for provider {provider_id}: {e}")
+        manager.disconnect(provider_id)
+
+# Endpoints administrativos
+@app.get("/admin/dashboard")
+def admin_dashboard(session: Session = Depends(get_session)):
+    """Painel administrativo com estatísticas"""
+    # Estatísticas básicas
+    total_providers = session.exec(select(Provider)).all()
+    total_jobs = session.exec(select(Job)).all()
+    total_quotes = session.exec(select(Quote)).all()
+    total_trips = session.exec(select(Trip)).all()
+    
+    # Receitas totais
+    completed_quotes = session.exec(
+        select(Quote).where(Quote.status == QuoteStatus.ACCEPTED)
+    ).all()
+    total_revenue = sum(quote.total_price or 0 for quote in completed_quotes)
+    
+    # Deslocamento total
+    total_displacement_km = sum(quote.displacement_km or 0 for quote in completed_quotes)
+    total_displacement_revenue = sum(quote.displacement_price or 0 for quote in completed_quotes)
+    
+    return {
+        "stats": {
+            "total_providers": len(total_providers),
+            "active_providers": len([p for p in total_providers if p.active]),
+            "total_jobs": len(total_jobs),
+            "total_quotes": len(total_quotes),
+            "total_trips": len(total_trips),
+            "total_revenue": round(total_revenue, 2),
+            "total_displacement_km": round(total_displacement_km, 2),
+            "total_displacement_revenue": round(total_displacement_revenue, 2)
+        },
+        "recent_activity": {
+            "pending_quotes": len([q for q in total_quotes if q.status == QuoteStatus.PENDING]),
+            "active_trips": len([t for t in total_trips if t.status in [TripStatus.STARTED, TripStatus.IN_PROGRESS]])
+        }
+    }
+
+@app.post("/admin/providers/{provider_id}/approve")
+def approve_provider(provider_id: int, session: Session = Depends(get_session)):
+    """Aprovar provider (ação administrativa)"""
+    provider = session.get(Provider, provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider não encontrado")
+    
+    provider.approved = True
+    provider.updated_at = datetime.utcnow()
+    session.commit()
+    
+    logger.info(f"Provider {provider_id} approved")
+    return {"message": "Provider aprovado com sucesso", "provider": provider}
+
+# Sistema de trips (deslocamentos)
+@app.post("/trips/start")
+def start_trip(
+    provider_id: int = Form(...),
+    job_id: int = Form(...),
+    quote_id: Optional[int] = Form(None),
+    session: Session = Depends(get_session)
+):
+    """Iniciar uma viagem/deslocamento"""
+    provider = session.get(Provider, provider_id)
+    job = session.get(Job, job_id)
+    
+    if not provider or not provider.approved:
+        raise HTTPException(status_code=404, detail="Provider não encontrado ou não aprovado")
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    
+    # Calcular estimativa de tempo
+    if provider.latitude and provider.longitude:
+        dist_data = google_distance_matrix(
+            provider.latitude, provider.longitude,
+            job.latitude, job.longitude
+        )
+        estimated_duration = dist_data["duration_min"]
+        distance_km = dist_data["distance_km"]
+    else:
+        estimated_duration = None
+        distance_km = None
+    
+    trip = Trip(
+        provider_id=provider_id,
+        job_id=job_id,
+        quote_id=quote_id,
+        started_at=datetime.utcnow(),
+        status=TripStatus.STARTED,
+        estimated_duration_min=estimated_duration,
+        distance_km=distance_km
+    )
+    
+    # Atualizar status do job
+    job.status = "in_progress"
+    
+    session.add(trip)
+    session.add(job)
+    session.commit()
+    session.refresh(trip)
+    
+    logger.info(f"Trip started: {trip.id} for job {job_id}")
+    return trip
+
+@app.post("/trips/{trip_id}/complete")
+def complete_trip(trip_id: int, path: str = Form(None), session: Session = Depends(get_session)):
+    """Completar uma viagem"""
+    trip = session.get(Trip, trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="Viagem não encontrada")
+    
+    trip.ended_at = datetime.utcnow()
+    trip.status = TripStatus.COMPLETED
+    if path:
+        trip.path = path
+    
+    # Calcular duração real
+    if trip.started_at and trip.ended_at:
+        duration = (trip.ended_at - trip.started_at).total_seconds() / 60
+        trip.actual_duration_min = round(duration)
+    
+    # Atualizar status do job
+    job = session.get(Job, trip.job_id)
+    if job:
+        job.status = "completed"
+        session.add(job)
+    
+    session.commit()
+    
+    logger.info(f"Trip completed: {trip_id}")
+    return trip
+
+# Sistema de cupons
+@app.post("/quotes/{quote_id}/apply-coupon")
+def apply_coupon(
+    quote_id: int,
+    coupon_code: str = Form(...),
+    session: Session = Depends(get_session)
+):
+    """Aplicar cupom de desconto a um orçamento"""
+    quote = session.get(Quote, quote_id)
+    if not quote:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    
+    # Simples sistema de cupons (em produção, usar tabela dedicada)
+    coupon_code = coupon_code.upper().strip()
+    discount_percentage = 0
+    
+    if coupon_code == "VISIT10":
+        discount_percentage = 10
+    elif coupon_code == "VISIT20":
+        discount_percentage = 20
+    elif coupon_code.startswith("FIRST"):
+        discount_percentage = 15
+    else:
+        raise HTTPException(status_code=400, detail="Cupom inválido ou expirado")
+    
+    discount_amount = (quote.total_price or 0) * (discount_percentage / 100)
+    new_total = (quote.total_price or 0) - discount_amount
+    
+    # Em produção, registrar o cupom aplicado
+    return {
+        "success": True,
+        "discount_percentage": discount_percentage,
+        "discount_amount": round(discount_amount, 2),
+        "original_total": quote.total_price,
+        "new_total": round(new_total, 2),
+        "coupon_code": coupon_code
+    }
+
+# Endpoint para providers próximos
+@app.get("/providers/nearby")
+def get_nearby_providers(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_km: float = Query(10.0),
+    max_results: int = Query(10),
+    session: Session = Depends(get_session)
+):
+    """Encontrar providers próximos a uma localização"""
+    all_providers = session.exec(
+        select(Provider).where(Provider.approved == True, Provider.active == True)
+    ).all()
+    
+    nearby_providers = []
+    for provider in all_providers:
+        if provider.latitude is None or provider.longitude is None:
+            continue
+            
+        distance = haversine_km(lat, lng, provider.latitude, provider.longitude)
+        if distance <= radius_km:
+            nearby_providers.append({
+                "provider": provider,
+                "distance_km": round(distance, 2)
+            })
+    
+    # Ordenar por distância
+    nearby_providers.sort(key=lambda x: x["distance_km"])
+    
+    return nearby_providers[:max_results]
+
+# Health check
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": {
+            "database": "ok",
+            "google_maps": "available" if GOOGLE_MAPS_API_KEY else "no_key"
+        }
+    }
+
+# Template HTML básico se não existir
+TEMPLATE_INDEX = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visit - Sistema de Deslocamento</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        #map { height: 500px; margin-bottom: 20px; border-radius: 8px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .providers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .provider-card { border: 1px solid #ddd; padding: 15px; border-radius: 8px; }
+        .stats { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Visit - Sistema de Deslocamento</h1>
+        
+        <div class="stats">
+            <h3>Estatísticas do Sistema</h3>
+            <div id="stats-content">Carregando...</div>
+        </div>
+        
+        <div id="map"></div>
+        
+        <h2>Prestadores de Serviço</h2>
+        <div class="providers-grid" id="providers-list">
+            {% for provider in providers %}
+            <div class="provider-card" data-lat="{{ provider.latitude }}" data-lng="{{ provider.longitude }}">
+                <h3>{{ provider.name }}</h3>
+                <p>Telefone: {{ provider.phone or 'Não informado' }}</p>
+                <p>Taxa/km: R$ {{ "%.2f"|format(provider.km_rate) }}</p>
+                <p>Veículo próprio: {{ "Sim" if provider.uses_own_car else "Não" }}</p>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Inicializar mapa
+        const map = L.map('map').setView([-23.5505, -46.6333], 12);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // Adicionar marcadores dos providers
+        document.querySelectorAll('.provider-card').forEach(card => {
+            const lat = parseFloat(card.dataset.lat);
+            const lng = parseFloat(card.dataset.lng);
+            
+            if (!isNaN(lat) && !isNaN(lng)) {
+                L.marker([lat, lng])
+                    .addTo(map)
+                    .bindPopup(card.querySelector('h3').textContent);
+            }
+        });
+
+        // Carregar estatísticas
+        fetch('/admin/dashboard')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('stats-content').innerHTML = `
+                    <p>Total de Prestadores: ${data.stats.total_providers}</p>
+                    <p>Total de Serviços: ${data.stats.total_jobs}</p>
+                    <p>Receita Total: R$ ${data.stats.total_revenue}</p>
+                `;
+            });
+    </script>
+</body>
+</html>
+"""
+
+# Criar template se não existir
+template_path = "./templates/index.html"
+if not os.path.exists(template_path):
+    with open(template_path, "w", encoding="utf-8") f:
+        f.write(TEMPLATE_INDEX)
+    logger.info("Template index.html created")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
