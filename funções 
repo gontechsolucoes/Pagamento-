@@ -767,7 +767,805 @@ curl http://localhost:5000/usuario/1/fidelidade
 # 5. Testar relatórios financeiros
 curl "http://localhost:5000/admin/relatorios/financeiro?data_inicio=2024-01-01"
 
-# 6. Ver documentação
-curl http://localhost:5000/api/docs
+Perfeito! Vou implementar TODAS as 30 funcionalidades de forma prática e final, sem IA.
+
+🚀 BACKEND COMPLETO - VISIT PLATAFORM
+
+1. Estrutura Final do Banco de Dados
+
+```python
+# app/models_complete.py
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, JSON, Enum
+from sqlalchemy.orm import relationship
+from datetime import datetime
+import enum
+
+class UserRole(str, enum.Enum):
+    CLIENT = "client"
+    PROVIDER = "provider"
+    ADMIN = "admin"
+
+class ServiceStatus(str, enum.Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+class PaymentStatus(str, enum.Enum):
+    PENDING = "pending"
+    PARTIAL = "partial"
+    PAID = "paid"
+    HELD = "held"  # Em disputa
+    REFUNDED = "refunded"
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(100), unique=True)
+    phone = Column(String(20))
+    role = Column(Enum(UserRole))
+    city = Column(String(50))
+    rating = Column(Float, default=5.0)
+    completed_services = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ServiceOrder(Base):
+    __tablename__ = "service_orders"
+    id = Column(Integer, primary_key=True)
+    title = Column(String(200))
+    description = Column(Text)
+    client_id = Column(Integer, ForeignKey('users.id'))
+    status = Column(Enum(ServiceStatus), default=ServiceStatus.PENDING)
+    total_value = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Novos campos para funcionalidades
+    city = Column(String(50))  # Para cálculo regional
+    max_price_adjustment = Column(Float, default=0.15)  # Limite de 15%
+    is_recurrent = Column(Boolean, default=False)
+    recurrence_pattern = Column(String(50))  # weekly, monthly
+    
+    client = relationship("User", foreign_keys=[client_id])
+    providers = relationship("OrderProvider", back_populates="order")
+    payments = relationship("Payment", back_populates="order")
+    materials = relationship("OrderMaterial", back_populates="order")
+    ratings = relationship("Rating", back_populates="order")
+
+class OrderProvider(Base):
+    __tablename__ = "order_providers"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('service_orders.id'))
+    provider_id = Column(Integer, ForeignKey('users.id'))
+    assigned_value = Column(Float)  # Valor designado para este prestador
+    role = Column(String(50))  # principal, helper, specialist
+    
+    order = relationship("ServiceOrder", back_populates="providers")
+    provider = relationship("User")
+
+class OrderMaterial(Base):
+    __tablename__ = "order_materials"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('service_orders.id'))
+    name = Column(String(100))
+    quantity = Column(Float)
+    unit_price = Column(Float)
+    supplier_id = Column(Integer, ForeignKey('users.id'))  # Se for fornecedor
+    includes_tool_rental = Column(Boolean, default=False)
+    
+    order = relationship("ServiceOrder", back_populates="materials")
+    supplier = relationship("User")
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('service_orders.id'))
+    amount = Column(Float)
+    status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
+    type = Column(String(20))  # advance, installment, final
+    installment_number = Column(Integer)  # Para parcelamentos
+    due_date = Column(DateTime)
+    paid_at = Column(DateTime)
+    
+    order = relationship("ServiceOrder", back_populates="payments")
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), unique=True)
+    balance = Column(Float, default=0.0)
+    total_earned = Column(Float, default=0.0)
+    
+    user = relationship("User")
+    transactions = relationship("WalletTransaction", back_populates="wallet")
+
+class WalletTransaction(Base):
+    __tablename__ = "wallet_transactions"
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey('wallets.id'))
+    amount = Column(Float)
+    type = Column(String(20))  # credit, debit, withdrawal
+    description = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    wallet = relationship("Wallet", back_populates="transactions")
+
+class Rating(Base):
+    __tablename__ = "ratings"
+    id = Column(Integer, primary_key=True)
+    order_id = Column(Integer, ForeignKey('service_orders.id'))
+    user_id = Column(Integer, ForeignKey('users.id'))
+    rating = Column(Integer)  # 1-5
+    comment = Column(Text)
+    is_anonymous = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    order = relationship("ServiceOrder", back_populates="ratings")
+    user = relationship("User")
+
+class CityPrice(Base):
+    __tablename__ = "city_prices"
+    id = Column(Integer, primary_key=True)
+    city = Column(String(50))
+    service_type = Column(String(50))
+    average_price = Column(Float)
+    last_updated = Column(DateTime, default=datetime.utcnow)
 ```
 
+2. Sistema de Pagamentos e Carteira
+
+```python
+# app/payment_system.py
+from datetime import datetime, timedelta
+
+class VisitPaymentSystem:
+    def __init__(self, db):
+        self.db = db
+        self.platform_fee = 0.10  # 10% padrão, pode variar por plano
+    
+    def calculate_dynamic_fee(self, provider_id, order_value):
+        """Calcula taxa dinâmica baseada no plano do prestador"""
+        provider = self.db.query(User).filter(User.id == provider_id).first()
+        # Lógica para planos premium (menor taxa)
+        if provider and hasattr(provider, 'premium_plan') and provider.premium_plan:
+            return 0.07  # 7% para premium
+        return self.platform_fee
+    
+    def create_payment_plan(self, order_id, total_value, advance_percentage=0.3):
+        """Cria plano de pagamento com sinal e parcelas"""
+        advance_amount = total_value * advance_percentage
+        remaining = total_value - advance_amount
+        
+        payments = [
+            {
+                'order_id': order_id,
+                'amount': advance_amount,
+                'type': 'advance',
+                'due_date': datetime.utcnow()
+            },
+            {
+                'order_id': order_id,
+                'amount': remaining,
+                'type': 'final',
+                'due_date': datetime.utcnow() + timedelta(days=7)
+            }
+        ]
+        
+        return payments
+    
+    def split_payment_among_providers(self, order_id, providers_data):
+        """Divide pagamento entre múltiplos prestadores"""
+        order = self.db.query(ServiceOrder).filter(ServiceOrder.id == order_id).first()
+        total = order.total_value
+        
+        for provider_data in providers_data:
+            provider_value = provider_data['assigned_value']
+            fee_percentage = self.calculate_dynamic_fee(provider_data['provider_id'], provider_value)
+            platform_fee = provider_value * fee_percentage
+            provider_net = provider_value - platform_fee
+            
+            # Criar registro de divisão
+            order_provider = OrderProvider(
+                order_id=order_id,
+                provider_id=provider_data['provider_id'],
+                assigned_value=provider_value,
+                role=provider_data.get('role', 'helper')
+            )
+            self.db.add(order_provider)
+            
+            # Adicionar à carteira do prestador (valor líquido)
+            self.add_to_wallet(provider_data['provider_id'], provider_net, order_id)
+        
+        self.db.commit()
+    
+    def add_to_wallet(self, user_id, amount, order_id):
+        """Adiciona valor à carteira do usuário"""
+        wallet = self.db.query(Wallet).filter(Wallet.user_id == user_id).first()
+        if not wallet:
+            wallet = Wallet(user_id=user_id, balance=0.0, total_earned=0.0)
+            self.db.add(wallet)
+        
+        wallet.balance += amount
+        wallet.total_earned += amount
+        
+        # Registrar transação
+        transaction = WalletTransaction(
+            wallet_id=wallet.id,
+            amount=amount,
+            type='credit',
+            description=f'Pagamento ordem #{order_id}',
+            created_at=datetime.utcnow()
+        )
+        self.db.add(transaction)
+    
+    def process_withdrawal(self, user_id, amount, fast_withdrawal=False):
+        """Processa saque da carteira"""
+        wallet = self.db.query(Wallet).filter(Wallet.user_id == user_id).first()
+        
+        if not wallet or wallet.balance < amount:
+            raise Exception("Saldo insuficiente")
+        
+        # Taxa para saque rápido
+        fee = amount * 0.02 if fast_withdrawal else 0.0
+        net_amount = amount - fee
+        
+        wallet.balance -= amount
+        
+        transaction = WalletTransaction(
+            wallet_id=wallet.id,
+            amount=-amount,
+            type='withdrawal',
+            description=f'Saque {"rápido" if fast_withdrawal else "normal"} - Taxa: R${fee:.2f}',
+            created_at=datetime.utcnow()
+        )
+        self.db.add(transaction)
+        
+        self.db.commit()
+        return net_amount
+```
+
+3. Sistema de Preços Regionais
+
+```python
+# app/regional_pricing.py
+class RegionalPricingEngine:
+    def __init__(self, db):
+        self.db = db
+        self.base_prices = {
+            'cleaning': 150.0,
+            'repair': 200.0,
+            'installation': 180.0,
+            # ... outros serviços
+        }
+    
+    def get_city_multiplier(self, city):
+        """Retorna multiplicador baseado na cidade"""
+        multipliers = {
+            'sao-paulo': 1.3,
+            'rio-de-janeiro': 1.25,
+            'brasilia': 1.2,
+            'default': 1.0
+        }
+        return multipliers.get(city.lower(), multipliers['default'])
+    
+    def calculate_service_price(self, service_type, city, complexity=1.0):
+        """Calcula preço baseado em serviço, cidade e complexidade"""
+        base_price = self.base_prices.get(service_type, 100.0)
+        city_multiplier = self.get_city_multiplier(city)
+        
+        return base_price * city_multiplier * complexity
+    
+    def update_city_prices(self):
+        """Atualiza preços médios por cidade baseado em transações recentes"""
+        # Buscar preços reais de serviços concluídos
+        recent_orders = self.db.query(ServiceOrder).filter(
+            ServiceOrder.status == ServiceStatus.COMPLETED,
+            ServiceOrder.created_at >= datetime.utcnow() - timedelta(days=30)
+        ).all()
+        
+        city_prices = {}
+        for order in recent_orders:
+            if order.city not in city_prices:
+                city_prices[order.city] = []
+            city_prices[order.city].append(order.total_value)
+        
+        # Atualizar tabela de preços
+        for city, prices in city_prices.items():
+            avg_price = sum(prices) / len(prices)
+            
+            city_price = self.db.query(CityPrice).filter(
+                CityPrice.city == city
+            ).first()
+            
+            if city_price:
+                city_price.average_price = avg_price
+                city_price.last_updated = datetime.utcnow()
+            else:
+                city_price = CityPrice(
+                    city=city,
+                    service_type='general',
+                    average_price=avg_price
+                )
+                self.db.add(city_price)
+        
+        self.db.commit()
+```
+
+4. Sistema de Match Inteligente
+
+```python
+# app/intelligent_matching.py
+class IntelligentMatching:
+    def __init__(self, db):
+        self.db = db
+    
+    def find_best_providers(self, order_id, max_providers=5):
+        """Encontra prestadores ideais para uma OS"""
+        order = self.db.query(ServiceOrder).filter(ServiceOrder.id == order_id).first()
+        
+        # Critérios de matching
+        providers = self.db.query(User).filter(
+            User.role == UserRole.PROVIDER,
+            User.city == order.city,
+            User.rating >= 4.0  # Mínimo de rating
+        ).all()
+        
+        # Ordenar por: rating, número de serviços, proximidade
+        scored_providers = []
+        for provider in providers:
+            score = self.calculate_match_score(provider, order)
+            scored_providers.append((provider, score))
+        
+        # Ordenar por score e retornar top N
+        scored_providers.sort(key=lambda x: x[1], reverse=True)
+        return [prov for prov, score in scored_providers[:max_providers]]
+    
+    def calculate_match_score(self, provider, order):
+        """Calcula score de compatibilidade"""
+        score = provider.rating * 20  # Peso maior para rating
+        
+        # Bônus por serviços concluídos
+        score += min(provider.completed_services * 0.1, 10)
+        
+        # Penalidade por muitas OS simultâneas
+        current_orders = self.count_current_orders(provider.id)
+        if current_orders > 3:
+            score -= (current_orders - 3) * 5
+        
+        return score
+    
+    def count_current_orders(self, provider_id):
+        """Conta ordens em andamento do prestador"""
+        return self.db.query(OrderProvider).filter(
+            OrderProvider.provider_id == provider_id
+        ).join(ServiceOrder).filter(
+            ServiceOrder.status.in_(['pending', 'in_progress'])
+        ).count()
+```
+
+5. API Principal Completa
+
+```python
+# app/main_complete.py
+from fastapi import FastAPI, Depends, Form, HTTPException
+from sqlalchemy.orm import Session
+
+app = FastAPI(title="Visit Platform - Complete")
+
+@app.post("/service-orders/")
+def create_service_order(
+    title: str = Form(...),
+    description: str = Form(...),
+    client_id: int = Form(...),
+    city: str = Form(...),
+    service_type: str = Form(...),
+    total_value: float = Form(None),
+    db: Session = Depends(get_db)
+):
+    """Cria ordem de serviço colaborativa"""
+    
+    # Calcular preço se não informado
+    pricing_engine = RegionalPricingEngine(db)
+    if not total_value:
+        total_value = pricing_engine.calculate_service_price(service_type, city)
+    
+    order = ServiceOrder(
+        title=title,
+        description=description,
+        client_id=client_id,
+        city=city,
+        total_value=total_value,
+        status=ServiceStatus.PENDING
+    )
+    db.add(order)
+    db.commit()
+    
+    return {"order_id": order.id, "calculated_price": total_value}
+
+@app.post("/service-orders/{order_id}/add-provider")
+def add_provider_to_order(
+    order_id: int,
+    provider_id: int = Form(...),
+    assigned_value: float = Form(...),
+    role: str = Form("helper"),
+    db: Session = Depends(get_db)
+):
+    """Adiciona prestador à OS colaborativa"""
+    order_provider = OrderProvider(
+        order_id=order_id,
+        provider_id=provider_id,
+        assigned_value=assigned_value,
+        role=role
+    )
+    db.add(order_provider)
+    db.commit()
+    
+    return {"message": "Prestador adicionado com sucesso"}
+
+@app.post("/service-orders/{order_id}/process-payment")
+def process_order_payment(
+    order_id: int,
+    advance_percentage: float = Form(0.3),
+    db: Session = Depends(get_db)
+):
+    """Processa pagamento com sinal e divisão automática"""
+    payment_system = VisitPaymentSystem(db)
+    order = db.query(ServiceOrder).filter(ServiceOrder.id == order_id).first()
+    
+    # Criar plano de pagamento
+    payments = payment_system.create_payment_plan(order_id, order.total_value, advance_percentage)
+    
+    for payment_data in payments:
+        payment = Payment(**payment_data)
+        db.add(payment)
+    
+    # Dividir entre prestadores
+    providers = db.query(OrderProvider).filter(OrderProvider.order_id == order_id).all()
+    providers_data = [{
+        'provider_id': prov.provider_id,
+        'assigned_value': prov.assigned_value,
+        'role': prov.role
+    } for prov in providers]
+    
+    payment_system.split_payment_among_providers(order_id, providers_data)
+    
+    return {"message": "Pagamento processado e dividido"}
+
+@app.post("/wallet/{user_id}/withdraw")
+def wallet_withdraw(
+    user_id: int,
+    amount: float = Form(...),
+    fast_withdrawal: bool = Form(False),
+    db: Session = Depends(get_db)
+):
+    """Saque da carteira Visit"""
+    payment_system = VisitPaymentSystem(db)
+    
+    try:
+        net_amount = payment_system.process_withdrawal(user_id, amount, fast_withdrawal)
+        return {"message": f"Saque processado. Valor líquido: R${net_amount:.2f}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/providers/matching/{order_id}")
+def get_matching_providers(order_id: int, db: Session = Depends(get_db)):
+    """Retorna prestadores compatíveis para a OS"""
+    matching_system = IntelligentMatching(db)
+    providers = matching_system.find_best_providers(order_id)
+    
+    return {
+        "providers": [
+            {
+                "id": prov.id,
+                "name": prov.name,
+                "rating": prov.rating,
+                "city": prov.city,
+                "completed_services": prov.completed_services
+            }
+            for prov in providers
+        ]
+    }
+
+@app.post("/service-orders/{order_id}/rate")
+def rate_service_order(
+    order_id: int,
+    user_id: int = Form(...),
+    rating: int = Form(...),
+    comment: str = Form(""),
+    is_anonymous: bool = Form(False),
+    db: Session = Depends(get_db)
+):
+    """Avaliação imediata do serviço"""
+    if rating < 1 or rating > 5:
+        raise HTTPException(status_code=400, detail="Avaliação deve ser entre 1 e 5")
+    
+    rating_record = Rating(
+        order_id=order_id,
+        user_id=user_id,
+        rating=rating,
+        comment=comment,
+        is_anonymous=is_anonymous
+    )
+    db.add(rating_record)
+    
+    # Atualizar rating do prestador
+    order = db.query(ServiceOrder).filter(ServiceOrder.id == order_id).first()
+    providers = db.query(OrderProvider).filter(OrderProvider.order_id == order_id).all()
+    
+    for order_prov in providers:
+        provider = db.query(User).filter(User.id == order_prov.provider_id).first()
+        # Recalcular rating médio
+        provider_ratings = db.query(Rating).join(ServiceOrder).join(OrderProvider).filter(
+            OrderProvider.provider_id == provider.id
+        ).all()
+        
+        if provider_ratings:
+            new_rating = sum(r.rating for r in provider_ratings) / len(provider_ratings)
+            provider.rating = round(new_rating, 1)
+    
+    db.commit()
+    return {"message": "Avaliação registrada com sucesso"}
+```
+
+6. Frontend Components Essenciais
+
+```jsx
+// src/components/ServiceOrderWizard.jsx
+import { useState } from 'react';
+
+export default function ServiceOrderWizard({ clientId }) {
+    const [step, setStep] = useState(1);
+    const [orderData, setOrderData] = useState({
+        title: '',
+        description: '',
+        city: '',
+        serviceType: '',
+        providers: [],
+        materials: []
+    });
+
+    const calculateDynamicPrice = async (city, serviceType) => {
+        const response = await fetch(`http://localhost:8000/calculate-price?city=${city}&service_type=${serviceType}`);
+        const data = await response.json();
+        return data.price;
+    };
+
+    const handleCityChange = async (city) => {
+        const price = await calculateDynamicPrice(city, orderData.serviceType);
+        setOrderData(prev => ({ ...prev, city, totalValue: price }));
+    };
+
+    const addProvider = (providerId, value, role) => {
+        setOrderData(prev => ({
+            ...prev,
+            providers: [...prev.providers, { providerId, value, role }]
+        }));
+    };
+
+    const createOrder = async () => {
+        const response = await fetch('http://localhost:8000/service-orders/', {
+            method: 'POST',
+            body: new URLSearchParams({
+                ...orderData,
+                client_id: clientId
+            })
+        });
+        
+        const data = await response.json();
+        
+        // Adicionar prestadores
+        for (const provider of orderData.providers) {
+            await fetch(`http://localhost:8000/service-orders/${data.order_id}/add-provider`, {
+                method: 'POST',
+                body: new URLSearchParams(provider)
+            });
+        }
+        
+        return data.order_id;
+    };
+
+    return (
+        <div className="max-w-4xl mx-auto bg-white rounded-lg shadow-lg p-6">
+            <h2 className="text-2xl font-bold mb-6">Nova Ordem de Serviço</h2>
+            
+            {step === 1 && (
+                <ServiceDetailsStep 
+                    data={orderData} 
+                    onChange={setOrderData}
+                    onCityChange={handleCityChange}
+                    onNext={() => setStep(2)}
+                />
+            )}
+            
+            {step === 2 && (
+                <ProvidersStep 
+                    orderId={orderData.id}
+                    providers={orderData.providers}
+                    onAddProvider={addProvider}
+                    onNext={() => setStep(3)}
+                    onBack={() => setStep(1)}
+                />
+            )}
+            
+            {step === 3 && (
+                <PaymentStep 
+                    orderData={orderData}
+                    onCreateOrder={createOrder}
+                    onBack={() => setStep(2)}
+                />
+            )}
+        </div>
+    );
+}
+
+// Componente para Step 1 - Detalhes do Serviço
+function ServiceDetailsStep({ data, onChange, onCityChange, onNext }) {
+    const cities = ['São Paulo', 'Rio de Janeiro', 'Brasília', 'Belo Horizonte'];
+    const serviceTypes = ['Limpeza', 'Reparo', 'Instalação', 'Pintura', 'Reforma'];
+
+    return (
+        <div className="space-y-4">
+            <h3 className="text-lg font-semibold">Detalhes do Serviço</h3>
+            
+            <input
+                type="text"
+                placeholder="Título do serviço"
+                value={data.title}
+                onChange={(e) => onChange({...data, title: e.target.value})}
+                className="w-full border rounded-lg p-3"
+            />
+            
+            <textarea
+                placeholder="Descrição detalhada"
+                value={data.description}
+                onChange={(e) => onChange({...data, description: e.target.value})}
+                className="w-full border rounded-lg p-3 h-24"
+            />
+            
+            <select 
+                value={data.city}
+                onChange={(e) => onCityChange(e.target.value)}
+                className="w-full border rounded-lg p-3"
+            >
+                <option value="">Selecione a cidade</option>
+                {cities.map(city => (
+                    <option key={city} value={city}>{city}</option>
+                ))}
+            </select>
+            
+            <select
+                value={data.serviceType}
+                onChange={(e) => onChange({...data, serviceType: e.target.value})}
+                className="w-full border rounded-lg p-3"
+            >
+                <option value="">Tipo de serviço</option>
+                {serviceTypes.map(type => (
+                    <option key={type} value={type}>{type}</option>
+                ))}
+            </select>
+            
+            {data.totalValue && (
+                <div className="bg-blue-50 p-3 rounded-lg">
+                    <p className="font-semibold">Preço calculado: R$ {data.totalValue.toFixed(2)}</p>
+                    <p className="text-sm text-blue-600">Baseado na localidade e tipo de serviço</p>
+                </div>
+            )}
+            
+            <button
+                onClick={onNext}
+                disabled={!data.title || !data.city}
+                className="w-full bg-blue-600 text-white py-3 rounded-lg disabled:opacity-50"
+            >
+                Próximo → Adicionar Prestadores
+            </button>
+        </div>
+    );
+}
+```
+
+```jsx
+// src/components/ProviderWallet.jsx
+import { useState, useEffect } from 'react';
+
+export default function ProviderWallet({ providerId }) {
+    const [wallet, setWallet] = useState(null);
+    const [withdrawAmount, setWithdrawAmount] = useState('');
+
+    useEffect(() => {
+        loadWallet();
+    }, [providerId]);
+
+    const loadWallet = async () => {
+        const response = await fetch(`http://localhost:8000/wallet/${providerId}`);
+        const data = await response.json();
+        setWallet(data);
+    };
+
+    const handleWithdraw = async (fast = false) => {
+        const response = await fetch(`http://localhost:8000/wallet/${providerId}/withdraw`, {
+            method: 'POST',
+            body: new URLSearchParams({
+                amount: withdrawAmount,
+                fast_withdrawal: fast.toString()
+            })
+        });
+        
+        const result = await response.json();
+        alert(result.message);
+        loadWallet();
+        setWithdrawAmount('');
+    };
+
+    if (!wallet) return <div>Carregando...</div>;
+
+    return (
+        <div className="bg-white rounded-lg shadow-lg p-6">
+            <h3 className="text-xl font-bold mb-4">Carteira Visit</h3>
+            
+            <div className="grid grid-cols-2 gap-4 mb-6">
+                <div className="bg-green-50 p-4 rounded-lg">
+                    <p className="text-green-600 font-semibold">Saldo Disponível</p>
+                    <p className="text-2xl font-bold">R$ {wallet.balance.toFixed(2)}</p>
+                </div>
+                
+                <div className="bg-blue-50 p-4 rounded-lg">
+                    <p className="text-blue-600 font-semibold">Total Ganho</p>
+                    <p className="text-2xl font-bold">R$ {wallet.total_earned.toFixed(2)}</p>
+                </div>
+            </div>
+
+            <div className="border-t pt-4">
+                <h4 className="font-semibold mb-3">Fazer Saque</h4>
+                
+                <div className="flex gap-2 mb-3">
+                    <input
+                        type="number"
+                        value={withdrawAmount}
+                        onChange={(e) => setWithdrawAmount(e.target.value)}
+                        placeholder="Valor do saque"
+                        className="flex-1 border rounded-lg p-2"
+                    />
+                    <button
+                        onClick={() => handleWithdraw(false)}
+                        disabled={!withdrawAmount || parseFloat(withdrawAmount) > wallet.balance}
+                        className="bg-green-600 text-white px-4 rounded-lg disabled:opacity-50"
+                    >
+                        Saque Normal (D+2)
+                    </button>
+                    <button
+                        onClick={() => handleWithdraw(true)}
+                        disabled={!withdrawAmount || parseFloat(withdrawAmount) > wallet.balance}
+                        className="bg-orange-600 text-white px-4 rounded-lg disabled:opacity-50"
+                    >
+                        Saque Rápido (2% taxa)
+                    </button>
+                </div>
+                
+                <p className="text-sm text-gray-600">
+                    Saque normal: sem taxas, processamento em 2 dias úteis<br/>
+                    Saque rápido: taxa de 2%, valor disponível em até 2 horas
+                </p>
+            </div>
+
+            <div className="mt-6">
+                <h4 className="font-semibold mb-3">Últimas Transações</h4>
+                {wallet.transactions?.map(transaction => (
+                    <div key={transaction.id} className="flex justify-between py-2 border-b">
+                        <div>
+                            <p className="font-medium">{transaction.description}</p>
+                            <p className="text-sm text-gray-500">
+                                {new Date(transaction.created_at).toLocaleDateString()}
+                            </p>
+                        </div>
+                        <p className={`font-bold ${transaction.amount > 0 ? 'text-green-600' : 'text-red-600'}`}>
+                            {transaction.amount > 0 ? '+' : ''}{transaction.amount.toFixed(2)}
+                        </p>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+```
+
+🚀 
